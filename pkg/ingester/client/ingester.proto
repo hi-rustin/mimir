@@ -67,6 +67,12 @@ message LabelValueSeriesCount {
 
 message ReadRequest {
   repeated QueryRequest queries = 1;
+
+  enum ResponseType {
+    SAMPLES = 0;
+    STREAMED_XOR_CHUNKS = 1;
+  }
+  repeated ResponseType accepted_response_types = 2;
 }
 
 message ReadResponse {

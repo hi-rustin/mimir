@@ -6,6 +6,8 @@
 package querier
 
 import (
+	"context"
+	"github.com/pkg/errors"
 	"net/http"
 
 	"github.com/go-kit/log"
@@ -22,62 +24,84 @@ import (
 const maxRemoteReadQuerySize = 1024 * 1024
 
 // RemoteReadHandler handles Prometheus remote read requests.
-func RemoteReadHandler(q storage.Queryable, logger log.Logger) http.Handler {
+func RemoteReadHandler(q storage.Queryable, lg log.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		var req client.ReadRequest
-		logger := util_log.WithContext(r.Context(), logger)
+		logger := util_log.WithContext(r.Context(), lg)
 		if _, err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRemoteReadQuerySize, nil, &req, util.RawSnappy); err != nil {
 			level.Error(logger).Log("msg", "failed to parse proto", "err", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		// Fetch samples for all queries in parallel.
-		resp := client.ReadResponse{
-			Results: make([]*client.QueryResponse, len(req.Queries)),
-		}
-		errors := make(chan error)
-		for i, qr := range req.Queries {
-			go func(i int, qr *client.QueryRequest) {
-				from, to, matchers, err := client.FromQueryRequest(qr)
-				if err != nil {
-					errors <- err
-					return
-				}
-
-				querier, err := q.Querier(ctx, int64(from), int64(to))
-				if err != nil {
-					errors <- err
-					return
-				}
-
-				params := &storage.SelectHints{
-					Start: int64(from),
-					End:   int64(to),
-				}
-				seriesSet := querier.Select(false, params, matchers...)
-				resp.Results[i], err = seriesSetToQueryResponse(seriesSet)
-				errors <- err
-			}(i, qr)
-		}
-
-		var lastErr error
-		for range req.Queries {
-			err := <-errors
-			if err != nil {
-				lastErr = err
-			}
-		}
-		if lastErr != nil {
-			http.Error(w, lastErr.Error(), http.StatusBadRequest)
+		respType, err := negotiateResponseType(req.AcceptedResponseTypes)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		w.Header().Add("Content-Type", "application/x-protobuf")
-		if err := util.SerializeProtoResponse(w, &resp, util.RawSnappy); err != nil {
-			level.Error(logger).Log("msg", "error sending remote read response", "err", err)
+
+		switch respType {
+		case client.STREAMED_XOR_CHUNKS:
+			remoteReadStreamedXORChunks(ctx, q, logger, w, &req)
+		default:
+			remoteReadSamples(ctx, q, logger, w, &req)
 		}
 	})
+}
+
+func remoteReadStreamedXORChunks(ctx context.Context, q storage.Queryable, logger log.Logger, w http.ResponseWriter, req *client.ReadRequest) {
+	panic("not implemented")
+}
+
+func remoteReadSamples(ctx context.Context, q storage.Queryable, logger log.Logger, w http.ResponseWriter, req *client.ReadRequest) {
+	w.Header().Add("Content-Type", "application/x-protobuf")
+	w.Header().Set("Content-Encoding", "snappy")
+
+	resp := client.ReadResponse{
+		Results: make([]*client.QueryResponse, len(req.Queries)),
+	}
+	// Fetch samples for all queries in parallel.
+	errors := make(chan error)
+
+	for i, qr := range req.Queries {
+		go func(i int, qr *client.QueryRequest) {
+			from, to, matchers, err := client.FromQueryRequest(qr)
+			if err != nil {
+				errors <- err
+				return
+			}
+
+			querier, err := q.Querier(ctx, int64(from), int64(to))
+			if err != nil {
+				errors <- err
+				return
+			}
+
+			params := &storage.SelectHints{
+				Start: int64(from),
+				End:   int64(to),
+			}
+			seriesSet := querier.Select(false, params, matchers...)
+			resp.Results[i], err = seriesSetToQueryResponse(seriesSet)
+			errors <- err
+		}(i, qr)
+	}
+
+	var lastErr error
+	for range req.Queries {
+		err := <-errors
+		if err != nil {
+			lastErr = err
+		}
+	}
+	if lastErr != nil {
+		http.Error(w, lastErr.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := util.SerializeProtoResponse(w, &resp, util.RawSnappy); err != nil {
+		level.Error(logger).Log("msg", "error sending remote read response", "err", err)
+	}
 }
 
 func seriesSetToQueryResponse(s storage.SeriesSet) (*client.QueryResponse, error) {
@@ -104,4 +128,22 @@ func seriesSetToQueryResponse(s storage.SeriesSet) (*client.QueryResponse, error
 	}
 
 	return result, s.Err()
+}
+
+func negotiateResponseType(accepted []client.ReadRequest_ResponseType) (client.ReadRequest_ResponseType, error) {
+	if len(accepted) == 0 {
+		accepted = []client.ReadRequest_ResponseType{client.SAMPLES}
+	}
+
+	supported := map[client.ReadRequest_ResponseType]struct{}{
+		client.SAMPLES:             {},
+		client.STREAMED_XOR_CHUNKS: {},
+	}
+
+	for _, resType := range accepted {
+		if _, ok := supported[resType]; ok {
+			return resType, nil
+		}
+	}
+	return 0, errors.Errorf("server does not support any of the requested response types: %v; supported: %v", accepted, supported)
 }
